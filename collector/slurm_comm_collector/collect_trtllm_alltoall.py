@@ -220,10 +220,16 @@ def create_mapping(rank: int, world_size: int):
     """
     from tensorrt_llm.mapping import Mapping
 
+    # Detect actual GPUs per node from environment or hardware
+    if "SLURM_NTASKS_PER_NODE" in os.environ:
+        gpus_per_node = int(os.environ["SLURM_NTASKS_PER_NODE"])
+    else:
+        gpus_per_node = torch.cuda.device_count()
+
     mapping = Mapping(
         world_size=world_size,
         rank=rank,
-        gpus_per_node=4,
+        gpus_per_node=gpus_per_node,
         tp_size=world_size,  # Must satisfy: tp_size * pp_size == world_size
         pp_size=1,
         moe_tp_size=1,
@@ -540,6 +546,12 @@ def benchmark_nvlink_two_sided_alltoall(
     """
     Benchmark NVLinkTwoSided All-to-All communication.
 
+    Matches the actual TRT-LLM inference flow:
+      1. prepare (mnnvl_moe_alltoallv_prepare_without_allgather)
+      2. dispatch (mnnvl_moe_alltoallv + memset_expert_ids)
+      3. [MoE compute - not benchmarked]
+      4. combine  (mnnvl_moe_alltoallv_combine with do_reduce=True)
+
     Args:
         test_case: Test case configuration
         mapping: TensorRT-LLM Mapping
@@ -564,7 +576,7 @@ def benchmark_nvlink_two_sided_alltoall(
     ep_rank = mapping.moe_ep_rank
     moe_dtype = test_case.moe_dtype
 
-    # Number of slots (same as num_experts for simple case)
+    # Number of slots (same as num_experts for simple case, differs with EPLB)
     num_slots = num_experts
 
     # Prepare test data
@@ -582,6 +594,7 @@ def benchmark_nvlink_two_sided_alltoall(
 
     # ============================================================================
     # Benchmark: alltoall_prepare
+    # Matches: WideEPMoE.alltoall_prepare / NVLinkTwoSided.prepare_dispatch
     # ============================================================================
     def prepare_func():
         return MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
@@ -600,12 +613,17 @@ def benchmark_nvlink_two_sided_alltoall(
     for _ in range(num_warmup):
         alltoall_info, _ = prepare_func()
     torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
 
     # Benchmark prepare
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
     for _ in range(num_iterations):
-        torch.cuda.synchronize()
+        # Barrier ensures all ranks start each iteration together,
+        # matching the synchronized execution in actual inference
+        if dist.is_initialized():
+            dist.barrier()
         start_event.record()
         alltoall_info, _ = prepare_func()
         end_event.record()
@@ -613,25 +631,43 @@ def benchmark_nvlink_two_sided_alltoall(
         all_prepare_times.append(start_event.elapsed_time(end_event))
 
     # ============================================================================
-    # Benchmark: alltoall_dispatch (All-to-All send)
+    # Benchmark: alltoall_dispatch (All-to-All send + memset_expert_ids)
+    # Matches: WideEPMoE.alltoall_dispatch / NVLinkTwoSided.dispatch
+    # In TRT-LLM source, dispatch ALWAYS includes memset_expert_ids:
+    #   mnnvl_moe_alltoallv(...) + memset_expert_ids(...)
     # ============================================================================
     def dispatch_func():
-        return MnnvlMoe.mnnvl_moe_alltoallv(
+        dispatched = MnnvlMoe.mnnvl_moe_alltoallv(
             [hidden_states, hidden_states_sf, token_selected_slots, token_final_scales],
             alltoall_info,
             alltoall_workspace,
             ep_rank,
             ep_size,
         )
+        # memset_expert_ids is always called after dispatch in TRT-LLM source
+        # See: WideEPMoE.alltoall_dispatch, NVLinkTwoSided.dispatch
+        recv_token_selected_slots = dispatched[2]  # token_selected_slots after dispatch
+        torch.ops.trtllm.memset_expert_ids(
+            recv_token_selected_slots,
+            alltoall_info.recv_rank_count_cumsum,
+            all_rank_max_num_tokens,
+            top_k,
+            num_slots,  # WideEPMoE uses num_slots; NVLinkTwoSided uses -1
+            ep_size,
+        )
+        return dispatched
 
     # Warmup
     for _ in range(num_warmup):
         dispatched = dispatch_func()
     torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
 
     # Benchmark dispatch
     for _ in range(num_iterations):
-        torch.cuda.synchronize()
+        if dist.is_initialized():
+            dist.barrier()
         start_event.record()
         dispatched = dispatch_func()
         end_event.record()
@@ -641,19 +677,20 @@ def benchmark_nvlink_two_sided_alltoall(
     # Get dispatched hidden states for combine benchmark
     recv_hidden_states = dispatched[0]
 
-    # Simulate MoE output (same shape as received hidden states, but always bfloat16 for combine)
-    # Combine always operates on expert output which is bfloat16
-    if recv_hidden_states.dtype == torch.uint8:
-        # For NVFP4, expert output is bfloat16
-        moe_output = torch.randn(recv_hidden_states.shape[0], hidden_size, dtype=torch.bfloat16, device=device)
-    elif recv_hidden_states.dtype == torch.float8_e4m3fn:
-        # For FP8, expert output is bfloat16
-        moe_output = torch.randn(recv_hidden_states.shape[0], hidden_size, dtype=torch.bfloat16, device=device)
-    else:
-        moe_output = torch.randn_like(recv_hidden_states)
+    # Simulate MoE output: always bfloat16, shape=[local_token_allocation_count, hidden_size]
+    # In actual inference, MoE expert computation output is always bfloat16
+    # The output shape is [alltoall_info.local_token_allocation_count, hidden_size]
+    # which equals [all_rank_max_num_tokens * ep_size, hidden_size]
+    local_token_allocation_count = alltoall_info.local_token_allocation_count
+    moe_output = torch.randn(
+        local_token_allocation_count, hidden_size,
+        dtype=torch.bfloat16, device=device
+    )
 
     # ============================================================================
-    # Benchmark: alltoall_combine (do_reduce=False, use_low_precision_combine=False)
+    # Benchmark: alltoall_combine (do_reduce=True matches actual inference default)
+    # Matches: WideEPMoE.alltoall_combine / NVLinkTwoSided.combine
+    # In TRT-LLM, combine uses do_reduce=True by default (sum over top_k dimension)
     # ============================================================================
     def combine_func():
         return MnnvlMoe.mnnvl_moe_alltoallv_combine(
@@ -665,19 +702,22 @@ def benchmark_nvlink_two_sided_alltoall(
             top_k=top_k,
             token_count=num_tokens,
             use_low_precision_combine=False,
-            do_reduce=False,
+            do_reduce=True,  # Match actual inference: sum over top_k dimension
         )
 
     # Warmup
     for _ in range(num_warmup):
         combined = combine_func()
     torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
 
     # Benchmark combine
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
     for _ in range(num_iterations):
-        torch.cuda.synchronize()
+        if dist.is_initialized():
+            dist.barrier()
         start_event.record()
         combined = combine_func()
         end_event.record()
@@ -685,7 +725,7 @@ def benchmark_nvlink_two_sided_alltoall(
         all_combine_times.append(start_event.elapsed_time(end_event))
 
     # ============================================================================
-    # Benchmark: alltoall_combine_low_precision (do_reduce=False, use_low_precision_combine=True)
+    # Benchmark: alltoall_combine_low_precision (use_low_precision_combine=True)
     # Only benchmark for NVFP4 dtype as low_precision_combine is most relevant for it
     # ============================================================================
     if moe_dtype == MoEDtype.NVFP4:
@@ -699,7 +739,7 @@ def benchmark_nvlink_two_sided_alltoall(
                 top_k=top_k,
                 token_count=num_tokens,
                 use_low_precision_combine=True,
-                do_reduce=False,
+                do_reduce=True,  # Match actual inference
             )
 
         # Warmup
@@ -710,12 +750,15 @@ def benchmark_nvlink_two_sided_alltoall(
                 # Low precision combine may not be supported
                 pass
         torch.cuda.synchronize()
+        if dist.is_initialized():
+            dist.barrier()
 
         # Benchmark combine with low precision
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         for _ in range(num_iterations):
-            torch.cuda.synchronize()
+            if dist.is_initialized():
+                dist.barrier()
             start_event.record()
             try:
                 combined_lp = combine_low_precision_func()
@@ -727,14 +770,22 @@ def benchmark_nvlink_two_sided_alltoall(
                 end_event.record()
                 end_event.synchronize()
 
-    # Calculate average latencies
-    prepare_latency = sum(all_prepare_times) / len(all_prepare_times) if all_prepare_times else 0.0
-    dispatch_latency = sum(all_dispatch_times) / len(all_dispatch_times) if all_dispatch_times else 0.0
-    combine_latency = sum(all_combine_times) / len(all_combine_times) if all_combine_times else 0.0
-    combine_low_precision_latency = (
-        sum(all_combine_low_precision_times) / len(all_combine_low_precision_times)
-        if all_combine_low_precision_times else 0.0
-    )
+    # Calculate average latencies (use median for robustness against outliers)
+    def calc_latency(times):
+        if not times:
+            return 0.0
+        sorted_times = sorted(times)
+        # Drop min and max, average the rest (trimmed mean)
+        if len(sorted_times) > 4:
+            trimmed = sorted_times[1:-1]
+        else:
+            trimmed = sorted_times
+        return sum(trimmed) / len(trimmed)
+
+    prepare_latency = calc_latency(all_prepare_times)
+    dispatch_latency = calc_latency(all_dispatch_times)
+    combine_latency = calc_latency(all_combine_times)
+    combine_low_precision_latency = calc_latency(all_combine_low_precision_times)
 
     return AlltoallBenchmarkResult(
         prepare_latency_ms=prepare_latency,
@@ -798,6 +849,7 @@ def run_benchmark(
     world_size: int,
     device: torch.device,
     output_file: str = "wideep_alltoall_perf.txt",
+    max_usable_sm_count: int = -1,
 ):
     """
     Run All-to-All benchmark and log results.
@@ -807,6 +859,11 @@ def run_benchmark(
         world_size: Total number of ranks
         device: CUDA device
         output_file: Output file path
+        max_usable_sm_count: Max SM count for MoE comm kernels (-1 = use all SMs).
+                             In actual inference, TRT-LLM may limit SMs for comm
+                             to leave headroom for MoE compute overlap.
+                             The NVLinkTwoSided kernel uses half of available SMs
+                             for communication channels.
     """
     import tensorrt_llm
 
@@ -816,6 +873,14 @@ def run_benchmark(
             print("ERROR: MNNVL (NVLink) not supported on this hardware.")
             print("NVLinkTwoSided requires full NVLink connectivity between GPUs.")
         return
+
+    # Configure SM count for MoE comm kernels if specified
+    # This matches the actual inference behavior where set_moe_max_usable_sm_count
+    # can be called to limit SM usage for communication kernels
+    if max_usable_sm_count > 0:
+        torch.ops.trtllm.set_moe_max_usable_sm_count(max_usable_sm_count)
+        if rank == 0:
+            print(f"Set max usable SM count for MoE comm: {max_usable_sm_count}")
 
     # Create mapping
     mapping = create_mapping(rank, world_size)
@@ -961,6 +1026,14 @@ def parse_args():
         default=10,
         help="Number of benchmark iterations (default: 10)",
     )
+    parser.add_argument(
+        "--max-sm-count",
+        type=int,
+        default=-1,
+        help="Max SM count for MoE comm kernels (-1 = use all SMs). "
+             "NVLinkTwoSided kernel uses half of available SMs for comm channels. "
+             "Set this to match the actual inference configuration.",
+    )
     return parser.parse_args()
 
 
@@ -978,7 +1051,11 @@ def main():
         print(f"Running with {world_size} GPUs")
 
     try:
-        run_benchmark(rank, world_size, device, output_file=args.output)
+        run_benchmark(
+            rank, world_size, device,
+            output_file=args.output,
+            max_usable_sm_count=args.max_sm_count,
+        )
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
