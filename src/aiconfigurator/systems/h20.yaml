@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+data_dir: data/h20  # relative to systems_dir
+gpu:
+  mem_bw: 4000000000000  # 4000GB/s (HBM3, ~4TB/s)
+  mem_bw_empirical_scaling_factor: 0.8  # nonofficial correction based on observations
+  mem_empirical_constant_latency: 0.000003  # 3us, nonofficial correction
+  mem_capacity: 103079215104  # 96GiB
+  bfloat16_tc_flops: 148000000000000  # 148TFLOPS
+  int8_tc_flops: 296000000000000  # 296TOPS
+  fp8_tc_flops: 296000000000000  # 296TFLOPS
+  power: 400  # Watt
+  sm_version: 90
+
+node:
+  num_gpus_per_node: 8
+  # Byte/s per GPU, single direction.  This deployment uses 4x CX7 NDR
+  # 400Gb/s NIC per node = 1600Gb/s/node = 200GB/s/node = 25GB/s per GPU.
+  inter_node_bw: 25000000000
+  intra_node_bw: 450000000000  # Byte/s per GPU, single direction (NVLink)
+  pcie_bw: 64000000000  # Byte/s, single direction, PCIe 5.0
+  p2p_latency: 0.00001  # 10us, nonofficial correction
+
+misc:
+  nccl_mem:  # nonofficial correction based on observations
+    1: 0
+    2: 358612992  # 342MB
+    4: 411041792  # 392MB
+    8: 411041792  # 392MB
+  other_mem: 3758096384  # 3.5GB safety margin for inaccurate mem calc
+  nccl_version: '2.27.3'
