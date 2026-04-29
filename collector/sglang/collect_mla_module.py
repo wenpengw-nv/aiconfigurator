@@ -204,14 +204,14 @@ def _get_mla_backend_list() -> list[str]:
       SM >= 100: ["trtllm_mla"]  — flashinfer MLA is not supported on Blackwell;
                   sglang auto-promotes to trtllm_mla and then fails kv_cache_dtype
                   validation.  Existing B200 perf data contains only trtllm_mla.
-      SM >= 90:  ["flashinfer", "fa3"]
+      SM >= 90:  ["flashinfer", "fa3", "flashmla"]
       SM < 90:   ["flashinfer"]
     """
     sm = get_sm_version()
     if sm >= 100:
         return ["trtllm_mla"]
     elif sm >= 90:
-        return ["flashinfer", "fa3"]
+        return ["flashinfer", "fa3", "flashmla"]
     else:
         return ["flashinfer"]
 
@@ -514,6 +514,13 @@ def load_model_runner(
     # model_type for sglang compatibility (glm_moe_dsa → deepseek_v3).
     local_model_path = _resolve_local_model_path(model_path)
 
+    # FlashMLA kernel hardcodes PAGE_SIZE=64; SGLang's ServerArgs.__post_init__
+    # auto-corrects page_size when attention_backend=="flashmla", but we set
+    # attention_backend AFTER construction (see below), so __post_init__ would
+    # leave page_size at its default and the KV pool would be allocated with the
+    # wrong layout (silent forward failures).  Pre-set page_size here.
+    flashmla_kwargs = {"page_size": 64} if attention_backend == "flashmla" else {}
+
     server_args = ServerArgs(
         model_path=local_model_path,
         dtype="auto",
@@ -525,6 +532,7 @@ def load_model_runner(
         disable_radix_cache=True,
         disable_cuda_graph=True,
         kv_cache_dtype=sglang_kv_dtype,
+        **flashmla_kwargs,
     )
 
     # Quantization control: bf16 (dummy weights) vs fp8 (real fp8 weight
