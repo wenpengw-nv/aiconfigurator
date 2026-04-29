@@ -4790,12 +4790,9 @@ class PerfDatabase:
             def get_silicon():
                 self._wideep_generation_mla_data.raise_if_not_loaded()
                 attn_backend = attention_backend or "flashinfer"
-                if attn_backend == "flashinfer":
-                    attn_data = self._wideep_generation_mla_data["flashinfer"]
-                elif attn_backend == "fa3":
-                    attn_data = self._wideep_generation_mla_data["fa3"]
-                else:
+                if attn_backend not in ("flashinfer", "fa3", "flashmla"):
                     raise ValueError(f"Unsupported attention backend: {attn_backend}")
+                attn_data = self._wideep_generation_mla_data[attn_backend]
                 # Convert tp_size to num_heads (assuming 128 total heads for DeepSeek)
                 num_heads = 128 // tp_size
                 mla_dict = attn_data[kvcache_quant_mode]
@@ -4917,12 +4914,15 @@ class PerfDatabase:
             def get_silicon():
                 self._wideep_context_mla_data.raise_if_not_loaded()
                 attn_backend = attention_backend or "flashinfer"
-                if attn_backend == "flashinfer":
-                    attn_data = self._wideep_context_mla_data["flashinfer"]
-                elif attn_backend == "fa3":
-                    attn_data = self._wideep_context_mla_data["fa3"]
-                else:
+                # No flashmla data is collected for the context (prefill) phase —
+                # wide-EP DeepSeek-V3 PD-disagg routes prefill through separate
+                # workers.  Fall back to flashinfer so flashmla deployments remain
+                # queryable end-to-end without a separate context sweep.
+                if attn_backend == "flashmla":
+                    attn_backend = "flashinfer"
+                if attn_backend not in ("flashinfer", "fa3"):
                     raise ValueError(f"Unsupported attention backend: {attn_backend}")
+                attn_data = self._wideep_context_mla_data[attn_backend]
 
                 # Convert tp_size to num_heads (assuming 128 total heads for DeepSeek)
                 num_heads = 128 // tp_size

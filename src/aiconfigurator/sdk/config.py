@@ -31,7 +31,7 @@ class ModelConfig:
     # model builder falvors
     sms: int = 20
     moe_backend: str = None  # for sglang wideep only, deepep
-    attention_backend: str = "flashinfer"  # 'flashinfer' or 'fa3', for sglang wideep only
+    attention_backend: str = "flashinfer"  # 'flashinfer' | 'fa3' | 'flashmla', for sglang wideep only
     enable_wideep: bool = False
     enable_eplb: bool = False  # Expert Parallel Load Balancing
     wideep_num_slots: int = None  # EPLB num_slots, defaults to num_experts if None
