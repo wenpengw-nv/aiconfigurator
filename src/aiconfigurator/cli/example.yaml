@@ -190,3 +190,33 @@ disagg_full:
   # modeling queueing-under-concurrency in the deployed system.
   # Used by both the constraint-mode search and ``pick_autoscale``.
   autoscale_ttft_correction_factor: 1.8
+
+# ---------------------------------------------------------------------------
+# EPD: three-stage Encode + Prefill + Decode disaggregation for VL models.
+# The vision encoder is served by a separate single-GPU encode worker pool,
+# sized analytically to match the prefill/decode rate.  Transfer time
+# (E->P embeddings, P->D KV) is not modeled.
+# ---------------------------------------------------------------------------
+epd_disagg:
+  serving_mode: disagg
+  enable_epd: true
+
+  # Multimodal workload (required for EPD)
+  isl: 2000
+  osl: 500
+  image_height: 448
+  image_width: 448
+  num_images_per_request: 2
+  ttft: 1000.0
+  tpot: 40.0
+  total_gpus: 32
+
+  prefill_model_path: Qwen/Qwen3-VL-32B-Instruct
+  prefill_system_name: h200_sxm
+  prefill_backend_name: trtllm
+  decode_model_path: Qwen/Qwen3-VL-32B-Instruct
+  decode_system_name: h200_sxm
+  decode_backend_name: trtllm
+
+  # Encode pool cap (optional; workers are always single-GPU tp=1)
+  max_encoder_workers: 32

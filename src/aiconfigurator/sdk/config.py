@@ -40,6 +40,11 @@ class ModelConfig:
     enable_wideep: bool = False
     enable_eplb: bool = False  # Expert Parallel Load Balancing
     wideep_num_slots: int = None  # EPLB num_slots, defaults to num_experts if None
+    # Vision encoder placement. True: the encoder runs on this worker (agg or
+    # prefill, the default). False: EPD mode -- the encoder is served by a
+    # separate encode worker pool, so this worker skips encoder ops while the
+    # image tokens still occupy its LLM context.
+    encoder_colocated: bool = True
 
     def resolve_moe_parallelism(self) -> tuple[int, int]:
         """Resolve and validate MoE parallelism dimensions in-place.

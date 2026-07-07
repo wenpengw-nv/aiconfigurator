@@ -263,6 +263,17 @@ class BaseBackend:
         if not model.encoder_ops:
             return encoder_latency_dict, encoder_energy_wms_dict, encoder_source_dict, 0
 
+        if not model.config.encoder_colocated:
+            # EPD: the encoder runs on a separate encode worker pool. Skip the
+            # encoder ops here, but the image tokens still occupy the LLM
+            # context (same accounting as the static_gen path).
+            return (
+                encoder_latency_dict,
+                encoder_energy_wms_dict,
+                encoder_source_dict,
+                self._visual_context_tokens(model, runtime_config),
+            )
+
         enc_cfg = getattr(model, "encoder_config", None)
         num_images = runtime_config.num_images_per_request
         if num_images <= 0 or not isinstance(enc_cfg, common.VisionEncoderConfig):
@@ -1125,6 +1136,9 @@ class BaseBackend:
         runtime_config: RuntimeConfig,
         batch_size: int,
     ) -> dict[str, float]:
+        if not model.config.encoder_colocated:
+            # EPD: encoder weights/activations live on the encode worker.
+            return {}
         enc_cfg = getattr(model, "encoder_config", None)
         if not model.encoder_ops or not isinstance(enc_cfg, common.VisionEncoderConfig):
             return {}

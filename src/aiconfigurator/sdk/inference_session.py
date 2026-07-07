@@ -4,6 +4,7 @@
 import copy
 import functools
 import logging
+import math
 import warnings
 from collections import defaultdict, namedtuple
 
@@ -16,6 +17,7 @@ from aiconfigurator.sdk.inference_summary import InferenceSummary
 from aiconfigurator.sdk.picking import (
     _AUTOSCALE_TTFT_CORRECTION_FACTOR,
     _RATE_MATCHING_DECODE_DEGRADATION_FACTOR,
+    _RATE_MATCHING_ENCODER_DEGRADATION_FACTOR,
     _RATE_MATCHING_PREFILL_DEGRADATION_FACTOR,
     _build_disagg_summary_dict,
 )
@@ -546,6 +548,8 @@ class DisaggInferenceSession:
         require_same_tp: bool = False,
         autoscale: bool = False,
         target_tpot: float | None = None,
+        enable_epd: bool = False,
+        max_encoder_workers: int = 32,
     ) -> InferenceSummary | None:
         """
         Run disagg with given constraints
@@ -572,6 +576,14 @@ class DisaggInferenceSession:
             decode_max_num_tokens (int): the decode max num tokens
             decode_num_worker_list (List[int]): the decode num worker list
             num_gpu_list (Optional[List[int]]): the num gpu list
+            enable_epd (bool): three-stage EPD for VL models -- serve the
+                vision encoder from a separate single-GPU encode worker pool
+                (sized analytically) instead of colocating it on the prefill
+                worker.  Uses ``self._encoder_database``/``self._encoder_backend``
+                when set (falling back to the prefill ones) and
+                ``self._encoder_latency_correction_scale``.  Transfer time is
+                not modeled.  Not supported with ``autoscale``.
+            max_encoder_workers (int): EPD encode pool cap.
 
         Returns:
             Optional[InferenceSummary]: the summary of the inference result, contains all the
@@ -582,6 +594,30 @@ class DisaggInferenceSession:
             raise ValueError(f"max_prefill_gpus must be a positive integer, got {max_prefill_gpus}")
         if max_decode_gpus is not None and max_decode_gpus <= 0:
             raise ValueError(f"max_decode_gpus must be a positive integer, got {max_decode_gpus}")
+        if enable_epd and autoscale:
+            raise ValueError("enable_epd is not supported with autoscale")
+
+        encoder_candidates: list[dict] | None = None
+        if enable_epd:
+            # Single implementation shared with the v2 sweep path (parity).
+            from aiconfigurator.sdk.sweep import _MAX_ENCODER_CANDIDATES, build_encoder_worker_candidates
+
+            encoder_candidates = build_encoder_worker_candidates(
+                model_path=model_path,
+                prefill_model_config=prefill_model_config,
+                runtime_config=runtime_config,
+                database=self._encoder_database or self._prefill_database,
+                backend_name=(self._encoder_backend or self._prefill_backend).name.value,
+                latency_correction=self._encoder_latency_correction_scale,
+            )
+            if not encoder_candidates:
+                raise ValueError("EPD enabled but no encode-worker candidate fits in GPU memory.")
+            encoder_candidates = sorted(encoder_candidates, key=lambda c: c["latency"])[:_MAX_ENCODER_CANDIDATES]
+            # EPD: the prefill worker no longer runs the encoder (its
+            # ttft/memory exclude it); the encode stage is prepended during
+            # rate matching.
+            prefill_model_config = copy.deepcopy(prefill_model_config)
+            prefill_model_config.encoder_colocated = False
 
         # minor perf optimization: convert num_gpu_list to a set to speed up lookup
         num_gpu_set = set[int](num_gpu_list) if num_gpu_list else set()
@@ -594,15 +630,40 @@ class DisaggInferenceSession:
             decode_gpus: int,
             rate_matching_prefill_degradation_factor: float,
             rate_matching_decode_degradation_factor: float,
-        ) -> tuple[int, int]:
+            encoder_throughput: float = 0.0,
+            encoder_degradation_factor: float = _RATE_MATCHING_ENCODER_DEGRADATION_FACTOR,
+        ) -> tuple[int, int, int]:
             """
-            Match the prefill and decode workers, return the best prefill and decode num worker
+            Match the prefill and decode workers, return the best prefill, decode
+            and (EPD only, else 0) encode num worker
             """
-            prefill_opt_num_worker, decode_opt_num_worker = -1, -1
+            prefill_opt_num_worker, decode_opt_num_worker, encoder_opt_num_worker = -1, -1, 0
             throughput_per_gpu_max = 0
             for decode_num_worker in decode_num_worker_list:
                 for prefill_num_worker in prefill_num_worker_list:
-                    num_gpu = prefill_gpus * prefill_num_worker + decode_gpus * decode_num_worker
+                    prefill_throughput_corrected = (
+                        prefill_throughput * prefill_num_worker * rate_matching_prefill_degradation_factor
+                    )
+                    decode_throughput_corrected = (
+                        decode_throughput * decode_num_worker * rate_matching_decode_degradation_factor
+                    )
+                    pd_rate = min(prefill_throughput_corrected, decode_throughput_corrected)
+
+                    if encoder_throughput > 0.0:
+                        # EPD: encode workers are single-GPU, so the smallest
+                        # pool that is not the bottleneck maximizes
+                        # throughput-per-GPU for this (p, d) pairing.
+                        encoder_num_worker = max(
+                            1, math.ceil(pd_rate / (encoder_throughput * encoder_degradation_factor))
+                        )
+                        if encoder_num_worker > max_encoder_workers:
+                            continue
+                    else:
+                        encoder_num_worker = 0
+
+                    num_gpu = (
+                        prefill_gpus * prefill_num_worker + decode_gpus * decode_num_worker + encoder_num_worker
+                    )
 
                     # if num_gpu_set is empty, we don't have any constraint on the number of gpus
                     # if num_gpu_set is not empty, we only consider the gpus that are in the set
@@ -616,13 +677,6 @@ class DisaggInferenceSession:
                         if decode_gpus * decode_num_worker > max_decode_gpus:
                             continue
 
-                    prefill_throughput_corrected = (
-                        prefill_throughput * prefill_num_worker * rate_matching_prefill_degradation_factor
-                    )
-                    decode_throughput_corrected = (
-                        decode_throughput * decode_num_worker * rate_matching_decode_degradation_factor
-                    )
-
                     # criteria 1, try to make prefill_throughput larger than decode_throughput
                     # otherwise, decode bs cannot be achieved and decode throughput cannot be
                     # achieved as well.
@@ -630,16 +684,17 @@ class DisaggInferenceSession:
                     #    continue
 
                     # criteria 2, try to make the throughput per gpu larger
-                    throughput_per_gpu = min(prefill_throughput_corrected, decode_throughput_corrected) / num_gpu
+                    throughput_per_gpu = pd_rate / num_gpu
 
                     if throughput_per_gpu > throughput_per_gpu_max:
                         throughput_per_gpu_max = throughput_per_gpu
-                        prefill_opt_num_worker, decode_opt_num_worker = (
+                        prefill_opt_num_worker, decode_opt_num_worker, encoder_opt_num_worker = (
                             prefill_num_worker,
                             decode_num_worker,
+                            encoder_num_worker,
                         )
 
-            return prefill_opt_num_worker, decode_opt_num_worker
+            return prefill_opt_num_worker, decode_opt_num_worker, encoder_opt_num_worker
 
         def _find_best_result_under_constraints(
             ttft: float,
@@ -718,26 +773,39 @@ class DisaggInferenceSession:
                             continue
                         prefill_throughput = float(prefill_worker["seq/s"])
                         prefill_gpus = prefill_worker["num_total_gpus"]
-                        prefill_num_worker, decode_num_worker = _match_workers(
-                            prefill_throughput=prefill_throughput,
-                            prefill_gpus=prefill_gpus,
-                            decode_throughput=decode_throughput,
-                            decode_gpus=decode_gpus,
-                            rate_matching_prefill_degradation_factor=rate_matching_prefill_degradation_factor,
-                            rate_matching_decode_degradation_factor=rate_matching_decode_degradation_factor,
-                        )
-                        if prefill_num_worker == -1 or decode_num_worker == -1:
-                            continue
+                        for encoder_worker in encoder_candidates or [None]:
+                            # Paired TTFT filter: the encode stage is serial in
+                            # front of prefill (prefill ttft already corrected).
+                            if (
+                                encoder_worker is not None
+                                and encoder_worker["latency"] + prefill_worker["ttft"] >= ttft
+                            ):
+                                continue
+                            prefill_num_worker, decode_num_worker, encoder_num_worker = _match_workers(
+                                prefill_throughput=prefill_throughput,
+                                prefill_gpus=prefill_gpus,
+                                decode_throughput=decode_throughput,
+                                decode_gpus=decode_gpus,
+                                rate_matching_prefill_degradation_factor=rate_matching_prefill_degradation_factor,
+                                rate_matching_decode_degradation_factor=rate_matching_decode_degradation_factor,
+                                encoder_throughput=float(encoder_worker["seq/s"])
+                                if encoder_worker is not None
+                                else 0.0,
+                            )
+                            if prefill_num_worker == -1 or decode_num_worker == -1:
+                                continue
 
-                        disagg_dict = _build_disagg_summary_dict(
-                            prefill_worker,
-                            prefill_num_worker,
-                            decode_worker,
-                            decode_num_worker,
-                            prefill_degradation_factor=rate_matching_prefill_degradation_factor,
-                            decode_degradation_factor=rate_matching_decode_degradation_factor,
-                        )
-                        category_results.append(disagg_dict)
+                            disagg_dict = _build_disagg_summary_dict(
+                                prefill_worker,
+                                prefill_num_worker,
+                                decode_worker,
+                                decode_num_worker,
+                                prefill_degradation_factor=rate_matching_prefill_degradation_factor,
+                                decode_degradation_factor=rate_matching_decode_degradation_factor,
+                                encoder_summary_dict=encoder_worker,
+                                encoder_num_worker=encoder_num_worker,
+                            )
+                            category_results.append(disagg_dict)
 
                 if category_results:
                     # only return the best one for each category

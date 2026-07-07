@@ -32,6 +32,9 @@ logger = logging.getLogger(__name__)
 _RATE_MATCHING_PREFILL_DEGRADATION_FACTOR = 0.9
 # comes from not saturating the batchsize slot of decode worker
 _RATE_MATCHING_DECODE_DEGRADATION_FACTOR = 0.92
+# EPD encode stage: same batching-bubble nature as prefill; to be calibrated
+# against a real EPD deployment
+_RATE_MATCHING_ENCODER_DEGRADATION_FACTOR = 0.9
 
 # TTFT correction for concurrent prefill queueing: with N=10 batches and
 # local concurrency lc=15-20, formula lc/20+0.95 gives ~1.8
@@ -50,6 +53,9 @@ def _build_disagg_summary_dict(
     decode_num_worker: int,
     prefill_degradation_factor: float = _RATE_MATCHING_PREFILL_DEGRADATION_FACTOR,
     decode_degradation_factor: float = _RATE_MATCHING_DECODE_DEGRADATION_FACTOR,
+    encoder_summary_dict: dict | None = None,
+    encoder_num_worker: int = 0,
+    encoder_degradation_factor: float = _RATE_MATCHING_ENCODER_DEGRADATION_FACTOR,
 ) -> dict:
     """Build a disagg summary row from independent prefill and decode dicts.
 
@@ -66,6 +72,15 @@ def _build_disagg_summary_dict(
             throughput during rate matching (default 0.9).
         decode_degradation_factor: Multiplicative degradation for decode
             throughput during rate matching (default 0.92).
+        encoder_summary_dict: EPD only -- encode-worker candidate dict (from
+            ``sweep.build_encoder_worker_candidates``).  When set, the prefill
+            dict must come from a run with ``encoder_colocated=False`` so its
+            ttft excludes the encoder, and the encode stage joins the rate
+            match as a third worker pool.  ``None`` keeps the classic
+            two-stage output unchanged (encoder colocated with prefill).
+        encoder_num_worker: Number of encode workers (EPD only).
+        encoder_degradation_factor: Multiplicative degradation for encode
+            throughput during rate matching (default 0.9).
 
     Returns:
         Dict with keys matching ``common.ColumnsDisagg``.
@@ -74,27 +89,56 @@ def _build_disagg_summary_dict(
         prefill_summary_dict["seq/s"] * prefill_num_worker * prefill_degradation_factor,
         decode_summary_dict["seq/s"] * decode_num_worker * decode_degradation_factor,
     )
+    if encoder_summary_dict is not None:
+        seq_s = min(seq_s, encoder_summary_dict["seq/s"] * encoder_num_worker * encoder_degradation_factor)
     prefill_gpus = prefill_summary_dict["pp"] * prefill_summary_dict["tp"] * prefill_summary_dict["dp"]
     decode_gpus = decode_summary_dict["pp"] * decode_summary_dict["tp"] * decode_summary_dict["dp"]
     num_total_gpus = prefill_gpus * prefill_num_worker + decode_gpus * decode_num_worker
+    if encoder_summary_dict is not None:
+        num_total_gpus += encoder_summary_dict["num_total_gpus"] * encoder_num_worker
     seq_s_gpu = seq_s / num_total_gpus if num_total_gpus > 0 else 0.0
 
     osl = prefill_summary_dict["osl"]
     tokens_s = seq_s * osl
     tokens_s_gpu = tokens_s / num_total_gpus if num_total_gpus > 0 else 0.0
-    encoder_latency = float(prefill_summary_dict.get("encoder_latency", 0.0))
-    encoder_memory = float(prefill_summary_dict.get("encoder_memory", 0.0))
-    # static_ctx ttft already includes colocated encoder latency.
-    request_latency = prefill_summary_dict["ttft"] + decode_summary_dict["tpot"] * max(osl - 1, 0)
+    if encoder_summary_dict is None:
+        encoder_latency = float(prefill_summary_dict.get("encoder_latency", 0.0))
+        encoder_memory = float(prefill_summary_dict.get("encoder_memory", 0.0))
+        # static_ctx ttft already includes colocated encoder latency.
+        ttft = prefill_summary_dict["ttft"]
+        e_workers, e_tp, e_pp, e_parallel = 0, 0, 0, ""
+    else:
+        # EPD: prefill ran with encoder_colocated=False, so the encode stage
+        # latency is prepended explicitly (transfer time not modeled).
+        encoder_latency = float(encoder_summary_dict["latency"])
+        encoder_memory = float(encoder_summary_dict.get("memory", 0.0))
+        ttft = encoder_latency + prefill_summary_dict["ttft"]
+        e_workers = encoder_num_worker
+        e_tp = encoder_summary_dict["tp"]
+        e_pp = encoder_summary_dict["pp"]
+        e_parallel = encoder_summary_dict["parallel"]
+    tpot = decode_summary_dict["tpot"]
+    request_latency = ttft + tpot * max(osl - 1, 0)
 
     # Weighted average power
-    ttft = prefill_summary_dict["ttft"]
-    tpot = decode_summary_dict["tpot"]
     decode_time = tpot * max(osl - 1, 0)
     prefill_power = prefill_summary_dict.get("power_w", 0.0)
     decode_power = decode_summary_dict.get("power_w", 0.0)
     total_time = ttft + decode_time
-    disagg_power_avg = (prefill_power * ttft + decode_power * decode_time) / total_time if total_time > 0 else 0.0
+    if encoder_summary_dict is None:
+        disagg_power_avg = (prefill_power * ttft + decode_power * decode_time) / total_time if total_time > 0 else 0.0
+    else:
+        encoder_power = encoder_summary_dict.get("power_w", 0.0)
+        disagg_power_avg = (
+            (
+                encoder_power * encoder_latency
+                + prefill_power * prefill_summary_dict["ttft"]
+                + decode_power * decode_time
+            )
+            / total_time
+            if total_time > 0
+            else 0.0
+        )
 
     return {
         "model": prefill_summary_dict["model"],
@@ -152,10 +196,10 @@ def _build_disagg_summary_dict(
         "(d)backend": decode_summary_dict.get("backend", ""),
         "(d)version": decode_summary_dict.get("version", ""),
         "(d)system": decode_summary_dict.get("system", ""),
-        "(e)workers": 0,
-        "(e)tp": 0,
-        "(e)pp": 0,
-        "(e)parallel": "",
+        "(e)workers": e_workers,
+        "(e)tp": e_tp,
+        "(e)pp": e_pp,
+        "(e)parallel": e_parallel,
         "(e)memory": encoder_memory,
         "power_w": disagg_power_avg,
     }

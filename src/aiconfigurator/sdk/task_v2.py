@@ -334,6 +334,10 @@ class Task:
     image_height: int = 0
     image_width: int = 0
     num_images_per_request: int = 1
+    # EPD (disagg only): serve the vision encoder from a separate single-GPU
+    # encode worker pool instead of colocating it on the prefill worker.
+    # Transfer time (E->P embeddings, P->D KV) is not modeled.
+    enable_epd: bool = False
     ttft: float = 1000.0
     tpot: float = 50.0
     # When True (default), sweep TPOT over the legacy grid to build the full Pareto
@@ -429,6 +433,7 @@ class Task:
     max_gpu_per_replica: int | None = None
     max_prefill_workers: int | None = None
     max_decode_workers: int | None = None
+    max_encoder_workers: int | None = None  # EPD encode pool cap; None -> 32
     prefill_max_batch_size: int = 1
     decode_max_batch_size: int = 512
     prefill_latency_correction: float = 1.1
@@ -1147,6 +1152,15 @@ class Task:
                 raise NotImplementedError(
                     f"AIConfigurator does not yet support the DeepSeek family on the vLLM backend ({role} side)."
                 )
+        if self.enable_epd:
+            # The VL-model requirement (encoder ops present) is enforced by
+            # sweep.build_encoder_worker_candidates at sweep time.
+            if self.image_height <= 0 or self.image_width <= 0:
+                raise ValueError("enable_epd requires a multimodal workload: set image_height/image_width > 0.")
+            if self.num_images_per_request <= 0:
+                raise ValueError("enable_epd requires num_images_per_request > 0.")
+            if self.max_encoder_workers is not None and self.max_encoder_workers <= 0:
+                raise ValueError(f"max_encoder_workers must be > 0, got {self.max_encoder_workers!r}.")
 
     def _validate_database_quant_modes(self) -> None:
         """Validate user's quant modes against the perf database's supported list.
@@ -1439,6 +1453,8 @@ class Task:
             "rate_matching_decode_degradation": self.rate_match_decode_degradation,
             "autoscale_ttft_correction_factor": self.autoscale_ttft_correction_factor,
             "require_same_tp": require_same_tp,
+            "enable_epd": self.enable_epd,
+            "max_encoder_workers": self.max_encoder_workers or 32,
         }
 
     # =====================================================================

@@ -90,6 +90,26 @@ def _make_decode_dict(**overrides) -> dict:
     return base
 
 
+def _make_encoder_dict(**overrides) -> dict:
+    """An EPD encode-worker candidate dict (sweep.build_encoder_worker_candidates)."""
+    base = {
+        "latency": 30.0,
+        "seq/s": 33.3,
+        "bs": 2,
+        "tp": 1,
+        "pp": 1,
+        "num_total_gpus": 1,
+        "parallel": "tp1pp1",
+        "memory": 4.5,
+        "power_w": 300.0,
+        "backend": "trtllm",
+        "version": "1.3.0",
+        "system": "h200_sxm",
+    }
+    base.update(overrides)
+    return base
+
+
 @pytest.mark.parametrize(
     "num_p, num_d",
     [
@@ -138,6 +158,38 @@ def test_rate_match_with_custom_degradation_factors():
         assert new_result[key] == old_result[key], (
             f"Field {key!r} differs with custom degradation: new={new_result[key]} vs old={old_result[key]}"
         )
+
+
+@pytest.mark.parametrize(
+    "num_p, num_d, num_e",
+    [
+        (1, 1, 1),
+        (2, 4, 1),
+        (4, 8, 3),
+        (1, 32, 16),
+    ],
+)
+def test_rate_match_dict_matches_picking_with_encoder(num_p, num_d, num_e):
+    """EPD three-stage rate matching must stay in parity, incl. the f_E constant."""
+    from aiconfigurator.sdk.picking import _RATE_MATCHING_ENCODER_DEGRADATION_FACTOR
+    from aiconfigurator.sdk.sweep import _RATE_MATCH_ENCODER_DEGRADATION
+
+    assert _RATE_MATCH_ENCODER_DEGRADATION == _RATE_MATCHING_ENCODER_DEGRADATION_FACTOR
+
+    p = _make_prefill_dict()
+    d = _make_decode_dict()
+    e = _make_encoder_dict()
+
+    new_result = _rate_match_dict(p, num_p, d, num_d, encoder_summary_dict=e, encoder_num_worker=num_e)
+    old_result = _build_disagg_summary_dict(p, num_p, d, num_d, encoder_summary_dict=e, encoder_num_worker=num_e)
+
+    assert set(new_result.keys()) == set(old_result.keys())
+    for key in new_result:
+        assert new_result[key] == old_result[key], (
+            f"Field {key!r} differs with encoder: new={new_result[key]} vs old={old_result[key]}"
+        )
+    assert new_result["(e)workers"] == num_e
+    assert new_result["ttft"] == e["latency"] + p["ttft"]
 
 
 def test_rate_match_zero_osl_does_not_divide_by_zero():

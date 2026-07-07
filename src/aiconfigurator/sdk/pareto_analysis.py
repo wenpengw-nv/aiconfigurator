@@ -310,6 +310,8 @@ def disagg_pareto(
     require_same_tp = kwargs.get("require_same_tp", False)
     autoscale = kwargs.get("autoscale", False)
     target_tpot = kwargs.get("target_tpot")
+    enable_epd = kwargs.get("enable_epd", False)
+    max_encoder_workers = kwargs.get("max_encoder_workers", 32)
 
     summary = disagg_sess.find_best_disagg_result_under_constraints(
         model_path=model_path,
@@ -328,6 +330,8 @@ def disagg_pareto(
         require_same_tp=require_same_tp,
         autoscale=autoscale,
         target_tpot=target_tpot,
+        enable_epd=enable_epd,
+        max_encoder_workers=max_encoder_workers,
     )
 
     return summary.get_summary_df()

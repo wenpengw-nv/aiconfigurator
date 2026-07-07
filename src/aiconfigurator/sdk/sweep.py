@@ -33,6 +33,7 @@ from __future__ import annotations
 import copy
 import functools
 import logging
+import math
 from typing import Any
 
 import numpy as np
@@ -58,6 +59,7 @@ logger = logging.getLogger(__name__)
 # (locked in via parity test; do not change without updating picking.py too).
 _RATE_MATCH_PREFILL_DEGRADATION = 0.9
 _RATE_MATCH_DECODE_DEGRADATION = 0.92
+_RATE_MATCH_ENCODER_DEGRADATION = 0.9
 
 # TTFT pre-correction for queueing under concurrency, sourced from
 # picking._AUTOSCALE_TTFT_CORRECTION_FACTOR (locked by integration parity test).
@@ -73,6 +75,12 @@ _MAX_PREFILL_WORKERS = 32
 _DEFAULT_DECODE_BATCH_SCHEDULE: list[int] = (
     list(range(1, 16, 1)) + list(range(16, 32, 2)) + list(range(32, 128, 4)) + list(range(128, 512, 8)) + [512]
 )
+
+# EPD encode-worker enumeration.  Under the varlen encoder semantics latency is
+# ~linear in batch, so throughput is nearly batch-invariant and batch mainly
+# trades off the TTFT encode segment -- a small schedule suffices.
+_DEFAULT_ENCODE_BATCH_SCHEDULE: list[int] = [1, 2, 4, 8]
+_MAX_ENCODER_CANDIDATES = 4
 
 # Default batch-size schedule used by sweep_agg.  Mirrors the schedule in
 # the legacy ``backend.find_best_agg_result_under_constraints`` so results
@@ -100,6 +108,9 @@ def _rate_match_dict(
     decode_num_worker: int,
     prefill_degradation: float = _RATE_MATCH_PREFILL_DEGRADATION,
     decode_degradation: float = _RATE_MATCH_DECODE_DEGRADATION,
+    encoder_summary_dict: dict | None = None,
+    encoder_num_worker: int = 0,
+    encoder_degradation: float = _RATE_MATCH_ENCODER_DEGRADATION,
 ) -> dict:
     """Compose per-worker prefill+decode metrics into one disagg row.
 
@@ -107,34 +118,62 @@ def _rate_match_dict(
     arithmetic as ``picking._build_disagg_summary_dict``; the parity test
     in ``tests/unit/sdk/sweep/test_rate_match_parity.py`` guards against
     drift.  See picking.py for the original implementation.
+
+    ``encoder_summary_dict`` (EPD only): encode-worker candidate dict from
+    ``build_encoder_worker_candidates``.  When set, the prefill dict must come
+    from a run with ``encoder_colocated=False`` (ttft excludes the encoder)
+    and the encode stage joins the rate match as a third worker pool.
+    ``None`` keeps the classic two-stage output unchanged.
     """
     p = prefill_summary_dict
     d = decode_summary_dict
+    e = encoder_summary_dict
     osl = p["osl"]
 
     seq_s = min(
         p["seq/s"] * prefill_num_worker * prefill_degradation,
         d["seq/s"] * decode_num_worker * decode_degradation,
     )
+    if e is not None:
+        seq_s = min(seq_s, e["seq/s"] * encoder_num_worker * encoder_degradation)
     prefill_gpus = p["pp"] * p["tp"] * p["dp"]
     decode_gpus = d["pp"] * d["tp"] * d["dp"]
     num_total_gpus = prefill_gpus * prefill_num_worker + decode_gpus * decode_num_worker
+    if e is not None:
+        num_total_gpus += e["num_total_gpus"] * encoder_num_worker
     seq_s_gpu = seq_s / num_total_gpus if num_total_gpus > 0 else 0.0
     tokens_s = seq_s * osl
     tokens_s_gpu = tokens_s / num_total_gpus if num_total_gpus > 0 else 0.0
-    encoder_latency = float(p.get("encoder_latency", 0.0))
-    encoder_memory = float(p.get("encoder_memory", 0.0))
-    # static_ctx ttft already includes colocated encoder latency.
-    request_latency = p["ttft"] + d["tpot"] * max(osl - 1, 0)
-
-    # Weighted average power across prefill and decode phases.
-    ttft = p["ttft"]
+    if e is None:
+        encoder_latency = float(p.get("encoder_latency", 0.0))
+        encoder_memory = float(p.get("encoder_memory", 0.0))
+        # static_ctx ttft already includes colocated encoder latency.
+        ttft = p["ttft"]
+        e_workers, e_tp, e_pp, e_parallel = 0, 0, 0, ""
+    else:
+        # EPD: prefill ran with encoder_colocated=False, so the encode stage
+        # latency is prepended explicitly (transfer time not modeled).
+        encoder_latency = float(e["latency"])
+        encoder_memory = float(e.get("memory", 0.0))
+        ttft = encoder_latency + p["ttft"]
+        e_workers, e_tp, e_pp, e_parallel = encoder_num_worker, e["tp"], e["pp"], e["parallel"]
     tpot = d["tpot"]
+    request_latency = ttft + tpot * max(osl - 1, 0)
+
+    # Weighted average power across encode (EPD only), prefill, decode phases.
     decode_time = tpot * max(osl - 1, 0)
     total_time = ttft + decode_time
     prefill_power = p.get("power_w", 0.0)
     decode_power = d.get("power_w", 0.0)
-    disagg_power_avg = (prefill_power * ttft + decode_power * decode_time) / total_time if total_time > 0 else 0.0
+    if e is None:
+        disagg_power_avg = (prefill_power * ttft + decode_power * decode_time) / total_time if total_time > 0 else 0.0
+    else:
+        encoder_power = e.get("power_w", 0.0)
+        disagg_power_avg = (
+            (encoder_power * encoder_latency + prefill_power * p["ttft"] + decode_power * decode_time) / total_time
+            if total_time > 0
+            else 0.0
+        )
 
     return {
         "model": p["model"],
@@ -192,12 +231,11 @@ def _rate_match_dict(
         "(d)backend": d.get("backend", ""),
         "(d)version": d.get("version", ""),
         "(d)system": d.get("system", ""),
-        # Encoder is colocated with prefill for VL; text-only models leave these
-        # visibility fields at zero/empty.
-        "(e)workers": 0,
-        "(e)tp": 0,
-        "(e)pp": 0,
-        "(e)parallel": "",
+        # Zero/empty unless EPD (encoder colocated with prefill, or text-only).
+        "(e)workers": e_workers,
+        "(e)tp": e_tp,
+        "(e)pp": e_pp,
+        "(e)parallel": e_parallel,
         "(e)memory": encoder_memory,
         "power_w": disagg_power_avg,
     }
@@ -636,6 +674,77 @@ def _get_disagg_worker_candidates(
     return summary_df
 
 
+def build_encoder_worker_candidates(
+    *,
+    model_path: str,
+    prefill_model_config: config.ModelConfig,
+    runtime_config: config.RuntimeConfig,
+    database: PerfDatabase,
+    backend_name: str,
+    latency_correction: float = 1.0,
+    batch_list: list[int] | None = None,
+) -> list[dict]:
+    """Enumerate EPD encode-worker candidates.
+
+    The encode worker only serves the vision encoder (ViT + projector), so the
+    candidate space is a single GPU (tp=1 -- dynamo encode workers scale
+    horizontally, not with intra-worker TP) x a small batch schedule.
+    Throughput unit is prompts/s: one batch of ``b`` requests covers
+    ``b * num_images_per_request`` images in one encoder pass.
+
+    Returns a list of candidate dicts with the minimal key set consumed by
+    ``_rate_match_dict`` / ``picking._build_disagg_summary_dict``.  Also used
+    by the legacy ``DisaggInferenceSession`` (single implementation; do not
+    duplicate).
+    """
+    backend = get_backend(backend_name)
+    enc_mc = copy.deepcopy(prefill_model_config)
+    enc_mc.tp_size = 1
+    enc_mc.pp_size = 1
+    enc_mc.attention_dp_size = 1
+    enc_mc.moe_tp_size = 1
+    enc_mc.moe_ep_size = 1
+    enc_mc.cp_size = 1
+    enc_mc.encoder_colocated = True  # this worker IS the encoder
+    model = get_model(model_path=model_path, model_config=enc_mc, backend_name=backend_name)
+    if not model.encoder_ops:
+        raise ValueError(f"EPD requires a VL model with encoder ops; {model_path} has none.")
+
+    mem_capacity_gib = database.system_spec["gpu"]["mem_capacity"] / (1 << 30)
+    candidates: list[dict] = []
+    for b in batch_list or _DEFAULT_ENCODE_BATCH_SCHEDULE:
+        point_rt = copy.deepcopy(runtime_config)
+        point_rt.batch_size = b
+        latency_dict, energy_dict, _, n_img_post = backend._run_encoder_phase(model, database, point_rt, b)
+        e_lat = sum(latency_dict.values()) * latency_correction
+        if e_lat <= 0 or n_img_post <= 0:
+            raise ValueError(
+                "EPD encoder phase produced no latency; the workload must specify "
+                "image_height/image_width (or num_image_tokens) and num_images_per_request > 0."
+            )
+        memory = backend._get_encoder_component_memory_for_runtime(model, point_rt, b)
+        if memory.get("total", 0.0) > mem_capacity_gib:
+            continue
+        energy = sum(energy_dict.values()) * latency_correction
+        candidates.append(
+            {
+                "latency": e_lat,
+                "seq/s": 1000.0 * b / e_lat,
+                "bs": b,
+                "tp": 1,
+                "pp": 1,
+                "num_total_gpus": 1,
+                "parallel": "tp1pp1",
+                "memory": memory.get("total", 0.0),
+                "power_w": energy / e_lat if e_lat > 0 else 0.0,
+                "backend": database.backend,
+                "version": database.version,
+                "system": database.system,
+            }
+        )
+    return candidates
+
+
 def _find_best_disagg_under_constraint(
     *,
     ttft_target: float,
@@ -653,6 +762,8 @@ def _find_best_disagg_under_constraint(
     decode_degradation: float,
     match_workers: Any,
     autoscale_ttft_correction_factor: float = _AUTOSCALE_TTFT_CORRECTION_FACTOR,
+    encoder_candidates: list[dict] | None = None,
+    encoder_degradation: float = _RATE_MATCH_ENCODER_DEGRADATION,
 ) -> pd.DataFrame | None:
     """For one (ttft, tpot) pair, filter + rate-match + pick best per decode parallel.
 
@@ -663,6 +774,11 @@ def _find_best_disagg_under_constraint(
     ``lru_cache`` is shared across all (ttft, tpot) pairs -- its result is
     independent of the target, so a per-pair cache would recompute identical
     matches.
+
+    ``encoder_candidates`` (EPD only): encode-worker candidates from
+    ``build_encoder_worker_candidates``; TTFT is then paired as
+    ``encoder latency + corrected prefill ttft``.  The encode-worker count is
+    derived analytically inside ``match_workers``, not enumerated.
     """
 
     p_corrected = prefill_summary_df.assign(ttft=prefill_summary_df["ttft"] * autoscale_ttft_correction_factor)
@@ -703,25 +819,35 @@ def _find_best_disagg_under_constraint(
                     continue
                 p_throughput = float(p_worker["seq/s"])
                 p_gpus = p_worker["num_total_gpus"]
-                p_num, d_num = match_workers(
-                    prefill_throughput=p_throughput,
-                    prefill_gpus=p_gpus,
-                    decode_throughput=d_throughput,
-                    decode_gpus=d_gpus,
-                    prefill_deg=prefill_degradation,
-                    decode_deg=decode_degradation,
-                )
-                if p_num == -1 or d_num == -1:
-                    continue
-                disagg_dict = _rate_match_dict(
-                    p_worker,
-                    p_num,
-                    d_worker,
-                    d_num,
-                    prefill_degradation=prefill_degradation,
-                    decode_degradation=decode_degradation,
-                )
-                category_results.append(disagg_dict)
+                for e_worker in encoder_candidates or [None]:
+                    # Paired TTFT filter: the encode stage is serial in front of
+                    # prefill (p_worker["ttft"] is already queueing-corrected).
+                    if e_worker is not None and e_worker["latency"] + p_worker["ttft"] >= ttft_target:
+                        continue
+                    p_num, d_num, e_num = match_workers(
+                        prefill_throughput=p_throughput,
+                        prefill_gpus=p_gpus,
+                        decode_throughput=d_throughput,
+                        decode_gpus=d_gpus,
+                        prefill_deg=prefill_degradation,
+                        decode_deg=decode_degradation,
+                        encoder_throughput=float(e_worker["seq/s"]) if e_worker is not None else 0.0,
+                        encoder_deg=encoder_degradation,
+                    )
+                    if p_num == -1 or d_num == -1:
+                        continue
+                    disagg_dict = _rate_match_dict(
+                        p_worker,
+                        p_num,
+                        d_worker,
+                        d_num,
+                        prefill_degradation=prefill_degradation,
+                        decode_degradation=decode_degradation,
+                        encoder_summary_dict=e_worker,
+                        encoder_num_worker=e_num,
+                        encoder_degradation=encoder_degradation,
+                    )
+                    category_results.append(disagg_dict)
         if category_results:
             best = max(category_results, key=lambda x: (x["tokens/s/gpu"], -x["num_total_gpus"]))
             all_category_results.append(best)
@@ -765,6 +891,8 @@ def sweep_disagg(
     rate_matching_decode_degradation: float | None = None,
     autoscale_ttft_correction_factor: float | None = None,
     predictor: Any = None,
+    enable_epd: bool = False,
+    max_encoder_workers: int = 32,
 ) -> pd.DataFrame:
     """Sweep prefill_parallel x decode_parallel x batches x workers with rate matching.
 
@@ -774,6 +902,15 @@ def sweep_disagg(
 
     The two databases / backends are accepted independently to support
     hetero-disagg (prefill and decode on different systems).
+
+    ``enable_epd``: three-stage EPD for VL models -- the vision encoder is
+    served by a separate single-GPU encode worker pool (sized analytically to
+    match the prefill/decode rate) instead of running colocated on the prefill
+    worker.  Transfer time (E->P embeddings, P->D KV) is not modeled.  The
+    encode stage reuses the prefill database/backend with latency correction 1
+    (the legacy session exposes a separate encoder correction knob).
+    ``num_total_gpus`` and any ``num_gpu_list`` filter then include the encode
+    GPUs.  Not supported together with ``autoscale``.
 
     Returns:
         DataFrame (possibly empty) with schema ``common.ColumnsDisagg``.
@@ -787,6 +924,10 @@ def sweep_disagg(
         raise ValueError(f"max_prefill_gpus must be > 0, got {max_prefill_gpus}")
     if max_decode_gpus is not None and max_decode_gpus <= 0:
         raise ValueError(f"max_decode_gpus must be > 0, got {max_decode_gpus}")
+    if enable_epd and autoscale:
+        raise ValueError("enable_epd is not supported with autoscale")
+    if enable_epd and max_encoder_workers <= 0:
+        raise ValueError(f"max_encoder_workers must be > 0, got {max_encoder_workers}")
 
     p_deg = (
         rate_matching_prefill_degradation
@@ -827,6 +968,29 @@ def sweep_disagg(
         prefill_max_num_tokens = runtime_config.isl
     max_prefill_batch_size = prefill_max_num_tokens // runtime_config.isl
     prefill_batch_range = range(1, max_prefill_batch_size + 1)
+
+    encoder_candidates: list[dict] | None = None
+    if enable_epd:
+        encoder_candidates = build_encoder_worker_candidates(
+            model_path=model_path,
+            prefill_model_config=prefill_model_config,
+            runtime_config=runtime_config,
+            database=prefill_database,
+            backend_name=prefill_backend_name,
+        )
+        if not encoder_candidates:
+            raise NoFeasibleConfigError(
+                "sweep_disagg: EPD enabled but no encode-worker candidate fits in GPU memory."
+            )
+        # Ascending latency: when the encode pool is not the bottleneck the
+        # candidates tie on tokens/s/gpu and the first (lowest-TTFT) wins;
+        # when it is, the max() over tokens/s/gpu still picks the
+        # high-throughput batch.
+        encoder_candidates = sorted(encoder_candidates, key=lambda c: c["latency"])[:_MAX_ENCODER_CANDIDATES]
+        # EPD: the prefill worker no longer runs the encoder (its ttft/memory
+        # exclude it); the encode stage is prepended during rate matching.
+        prefill_model_config = copy.deepcopy(prefill_model_config)
+        prefill_model_config.encoder_colocated = False
 
     prefill_summary_df = _get_disagg_worker_candidates(
         model_path=model_path,
@@ -908,12 +1072,26 @@ def sweep_disagg(
         decode_gpus: int,
         prefill_deg: float,
         decode_deg: float,
-    ) -> tuple[int, int]:
-        prefill_opt, decode_opt = -1, -1
+        encoder_throughput: float = 0.0,
+        encoder_deg: float = _RATE_MATCH_ENCODER_DEGRADATION,
+    ) -> tuple[int, int, int]:
+        prefill_opt, decode_opt, encoder_opt = -1, -1, 0
         throughput_per_gpu_max = 0.0
         for d_num in d_num_workers:
             for p_num in p_num_workers:
-                num_gpu = prefill_gpus * p_num + decode_gpus * d_num
+                p_corrected = prefill_throughput * p_num * prefill_deg
+                d_corrected = decode_throughput * d_num * decode_deg
+                pd_rate = min(p_corrected, d_corrected)
+                if encoder_throughput > 0.0:
+                    # EPD: encode workers are single-GPU, so the smallest pool
+                    # that is not the bottleneck maximizes throughput-per-GPU
+                    # for this (p_num, d_num) -- no need to enumerate.
+                    e_num = max(1, math.ceil(pd_rate / (encoder_throughput * encoder_deg)))
+                    if e_num > max_encoder_workers:
+                        continue
+                else:
+                    e_num = 0
+                num_gpu = prefill_gpus * p_num + decode_gpus * d_num + e_num
                 if num_gpu_set and num_gpu not in num_gpu_set:
                     continue
                 if max_prefill_gpus is not None and max_decode_gpus is not None:
@@ -921,13 +1099,11 @@ def sweep_disagg(
                         continue
                     if decode_gpus * d_num > max_decode_gpus:
                         continue
-                p_corrected = prefill_throughput * p_num * prefill_deg
-                d_corrected = decode_throughput * d_num * decode_deg
-                tpg = min(p_corrected, d_corrected) / num_gpu
+                tpg = pd_rate / num_gpu
                 if tpg > throughput_per_gpu_max:
                     throughput_per_gpu_max = tpg
-                    prefill_opt, decode_opt = p_num, d_num
-        return prefill_opt, decode_opt
+                    prefill_opt, decode_opt, encoder_opt = p_num, d_num, e_num
+        return prefill_opt, decode_opt, encoder_opt
 
     disagg_df = pd.DataFrame(columns=common.ColumnsDisagg)
     for ttft_c, tpot_c in constraint_pairs:
@@ -948,6 +1124,7 @@ def sweep_disagg(
             decode_degradation=d_deg,
             match_workers=_match_workers,
             autoscale_ttft_correction_factor=ttft_corr,
+            encoder_candidates=encoder_candidates,
         )
         if partial is not None:
             disagg_df = pd.concat([disagg_df, partial], axis=0, ignore_index=True)

@@ -445,6 +445,63 @@ class TestVarlenAttentionMultiImage:
             assert eff_batch == batch_size * n_img
 
 
+class TestEncoderColocatedSwitch:
+    """EPD: ``encoder_colocated=False`` strips the encoder from this worker
+    while the image tokens still occupy its LLM context."""
+
+    def _run_static_ctx(self, encoder_colocated: bool):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from aiconfigurator.sdk.backends.trtllm_backend import TRTLLMBackend
+
+        model_config = config.ModelConfig(encoder_colocated=encoder_colocated)
+        model = get_model("Qwen/Qwen3-VL-32B-Instruct", model_config, "trtllm")
+        database = SimpleNamespace(
+            backend="trtllm",
+            version="10.0",
+            system="h200_sxm",
+            system_spec={
+                "gpu": {"mem_capacity": 80 * (1 << 30)},
+                "misc": {"nccl_mem": {1: 500 * 1024 * 1024, 8: 1024 * 1024 * 1024}, "other_mem": 200 * 1024 * 1024},
+            },
+        )
+
+        def _query(*args, **kwargs):
+            # Latency proportional to token volume, so context latency is
+            # sensitive to the effective ISL (isl + image tokens).
+            val = float(kwargs.get("x", 1) or 1)
+            return MagicMock(__float__=lambda s, v=val: v, energy=0.0, source="silicon")
+
+        for op in model.context_ops + model.generation_ops + model.encoder_ops:
+            op.query = MagicMock(side_effect=_query)
+
+        rc = RuntimeConfig(
+            batch_size=1, isl=512, osl=1, image_height=448, image_width=448, num_images_per_request=1
+        )
+        return TRTLLMBackend().run_static(model, database, rc, mode="static_ctx")
+
+    def test_external_encoder_strips_latency_and_memory_but_keeps_image_context(self):
+        colocated = self._run_static_ctx(encoder_colocated=True)
+        external = self._run_static_ctx(encoder_colocated=False)
+
+        enc_lat = sum(colocated.get_encoder_latency_dict().values())
+        assert enc_lat > 0
+        assert external.get_encoder_latency_dict() == {}
+        assert external.get_encoder_memory() == {}
+
+        # Equal context latency (ops scale with token volume) implies the
+        # effective ISL still contains the image tokens.
+        ctx_colocated = sum(colocated.get_context_latency_dict().values())
+        ctx_external = sum(external.get_context_latency_dict().values())
+        assert ctx_external == pytest.approx(ctx_colocated)
+        assert ctx_external > 0
+
+        ttft_colocated = colocated.get_summary_df()["ttft"].iloc[0]
+        ttft_external = external.get_summary_df()["ttft"].iloc[0]
+        assert ttft_external == pytest.approx(ttft_colocated - enc_lat, rel=1e-3)
+
+
 class TestEncoderMemoryInSummary:
     """Tests that run_static populates encoder_memory for VL models."""
 
